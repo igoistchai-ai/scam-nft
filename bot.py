@@ -449,14 +449,30 @@ class BusinessBot:
         cid = msg.get("business_connection_id")
         user = msg.get("from") or {}
         chat = msg.get("chat") or {}
+        LOG.info("MQ cmd: cid=%s user=%s chat=%s type=%s",
+                 cid, user.get("id"), chat.get("id"), chat.get("type"))
         if not cid or not user.get("id"):
+            LOG.warning("MQ skip: no cid or user")
             return
         conn = self.ensure_connection(cid)
-        if not conn or not conn["enabled"] or not conn["can_reply"]:
+        LOG.info("MQ conn: %s", conn)
+        if not conn:
+            LOG.warning("MQ skip: conn not found for cid=%s", cid)
             return
-        if not self.allowed_owner(conn["owner_id"]) or user["id"] != conn["owner_id"]:
+        if not conn["enabled"]:
+            LOG.warning("MQ skip: conn disabled")
+            return
+        if not conn["can_reply"]:
+            LOG.warning("MQ skip: can_reply=0")
+            return
+        if not self.allowed_owner(conn["owner_id"]):
+            LOG.warning("MQ skip: owner %s not allowed", conn["owner_id"])
+            return
+        if user["id"] != conn["owner_id"]:
+            LOG.warning("MQ skip: user %s != owner %s", user["id"], conn["owner_id"])
             return
         if chat.get("id") == conn["owner_id"]:
+            LOG.warning("MQ skip: self-chat")
             return
         try:
             parsed = parse_command(text)
