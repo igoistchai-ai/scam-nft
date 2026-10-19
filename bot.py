@@ -449,21 +449,14 @@ class BusinessBot:
         cid = msg.get("business_connection_id")
         user = msg.get("from") or {}
         chat = msg.get("chat") or {}
-        if not cid or not user.get("id") or chat.get("type") != "private":
+        if not cid or not user.get("id"):
             return
         conn = self.ensure_connection(cid)
-        if not conn or not conn["enabled"]:
-            return
-        if not conn["can_reply"]:
-            self.send(chat["id"],
-                      "⚠️ Боту не выдано право отвечать в этом чате. "
-                      "Включите «Разрешить отвечать» в настройках Business-бота.", cid)
+        if not conn or not conn["enabled"] or not conn["can_reply"]:
             return
         if not self.allowed_owner(conn["owner_id"]) or user["id"] != conn["owner_id"]:
-            # Stranger cannot request an offer on the owner's behalf.
             return
-        # Блокируем только личный чат владельца с самим собой (Saved Messages)
-        if chat.get("id") == conn["owner_id"] and chat.get("type") == "private":
+        if chat.get("id") == conn["owner_id"]:
             return
         try:
             parsed = parse_command(text)
@@ -477,6 +470,10 @@ class BusinessBot:
         obj = {"url": parsed.url, "name": parsed.name,
                "number": parsed.number, "stars": parsed.stars,
                "expires_at": self.store.offer(item_id)["expires_at"]}
+        # Удаление команды и отправка оффера параллельно
+        delete_thread = threading.Thread(
+            target=self.delete_command, args=(cid, msg["message_id"]), daemon=True)
+        delete_thread.start()
         try:
             result = self.send_rendered(chat["id"], cid, obj, item_id)
         except TelegramError as exc:
@@ -489,7 +486,6 @@ class BusinessBot:
             raise
         self.store.set_sent(item_id, result["message_id"])
         LOG.info("Sent simulated offer %d to chat %d", item_id, chat["id"])
-        self.delete_command(cid, msg["message_id"])
 
     def callback(self, payload: dict):
         callback_id = payload.get("id", "")
