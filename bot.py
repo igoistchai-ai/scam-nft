@@ -149,7 +149,8 @@ def render_offer(offer: dict, custom: bool) -> str:
         f"за подарок {gift_link}.\n\n"
         f"Предложение действует ещё <b>{timer}</b>\n\n"
         "<i>данная оплата настоящая, полностью потвержденно от TELEGRAM; "
-        "после кнопки принять, отправьте пожалуйста подарок.</i>"
+        "после кнопки принять, отправьте пожалуйста подарок.</i>\n\n"
+        "чтобы принять напишите <b>принять</b> чтобы отклонить напишите <b>отклонить</b>"
     )
 
 
@@ -183,11 +184,7 @@ def render_final(offer: dict, custom: bool) -> str:
 
 
 def keyboard(offer_id: int, url: str) -> dict:
-    return {"inline_keyboard": [
-        [{"text": "ПОКАЗАТЬ ПОДАРОК", "url": url}],
-        [{"text": " Отклонить", "callback_data": f"demo:no:{offer_id}"},
-         {"text": " Принять", "callback_data": f"demo:yes:{offer_id}"}],
-    ]}
+    return {"inline_keyboard": []}
 
 
 class Store:
@@ -428,6 +425,51 @@ class BusinessBot:
             total, active = self.store.connection_count(who)
             self.send(who, f"Подключений: {total}\nАктивных с правом ответа: {active}\n"
                       "Режим: тестовые NFT-офферы без транзакций.")
+        elif re.match(r"^\.mq(?:\s|$)", text, re.I):
+            # .mq из лички бота: .mq 5000 https://t.me/nft/Name-1234 CHAT_ID
+            self._private_mq(who, text)
+
+    def _private_mq(self, who: int, text: str):
+        """Отправка оффера из лички бота: .mq 5000 https://t.me/nft/Name-1234 CHAT_ID"""
+        parts = text.strip().split()
+        if len(parts) != 4:
+            self.send(who, "Формат: <code>.mq 5000 https://t.me/nft/Name-1234 CHAT_ID</code>\n"
+                      "CHAT_ID — числовой ID чата куда отправить оффер (должен быть подключён).")
+            return
+        try:
+            target_chat = int(parts[3])
+        except ValueError:
+            self.send(who, "⚠️ CHAT_ID должен быть числом.")
+            return
+        try:
+            parsed = parse_command(" ".join(parts[:3]))
+        except ValueError as exc:
+            self.send(who, f"⚠️ {escape(str(exc))}")
+            return
+        # Ищем подключение для этого чата
+        conn = self.store.one(
+            "SELECT * FROM connections WHERE owner_id=? AND enabled=1 AND can_reply=1 LIMIT 1",
+            (who,))
+        if not conn:
+            self.send(who, "⚠️ Нет активных подключений с правом ответа.")
+            return
+        cid = conn["connection_id"]
+        item_id, fresh = self.store.new_offer(
+            cid, who, target_chat, int(time.time()), parsed, self.ttl)
+        if not fresh:
+            self.send(who, "⚠️ Оффер для этого чата уже активен.")
+            return
+        obj = {"url": parsed.url, "name": parsed.name,
+               "number": parsed.number, "stars": parsed.stars,
+               "expires_at": self.store.offer(item_id)["expires_at"]}
+        try:
+            result = self.send_rendered(target_chat, cid, obj, item_id)
+            self.store.set_sent(item_id, result["message_id"])
+            self.send(who, f"✅ Оффер отправлен в чат {target_chat}")
+            LOG.info("Private MQ: sent offer %d to chat %d", item_id, target_chat)
+        except TelegramError as exc:
+            self.store.set_failed(item_id)
+            self.send(who, f"⚠️ Не удалось отправить: {escape(str(exc))}")
 
     def delete_command(self, cid: str, message_id: int):
         """Delete an owner's own .mq command after successfully posting the demo."""
@@ -444,6 +486,32 @@ class BusinessBot:
 
     def business_message(self, msg: dict):
         text = msg.get("text") or ""
+        stripped = text.strip().lower()
+
+        # Обработка "принять" / "отклонить"
+        if stripped in ("принять", "отклонить"):
+            cid = msg.get("business_connection_id")
+            chat = msg.get("chat") or {}
+            user = msg.get("from") or {}
+            if cid and chat.get("id") and user.get("id"):
+                conn = self.ensure_connection(cid)
+                if conn and conn["enabled"] and user["id"] != conn["owner_id"]:
+                    # Ищем активный оффер в этом чате
+                    offer = self.store.one(
+                        "SELECT * FROM offers WHERE chat_id=? AND status='pending' "
+                        "ORDER BY created_at DESC LIMIT 1", (chat["id"],))
+                    if offer:
+                        now = int(time.time())
+                        new_state = "expired" if now >= offer["expires_at"] else (
+                            "accepted" if stripped == "принять" else "declined")
+                        if self.store.status(offer["id"], new_state, now):
+                            try:
+                                self.update_message(self.store.offer(offer["id"]))
+                                self.store.set_rendered(offer["id"])
+                            except TelegramError as exc:
+                                LOG.warning("Cannot update offer %d: %s", offer["id"], exc)
+            return
+
         if not re.match(r"^\.mq(?:\s|$)", text.strip(), re.I):
             return
         cid = msg.get("business_connection_id")
