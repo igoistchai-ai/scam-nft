@@ -400,7 +400,11 @@ class BusinessBot:
         conn = self.store.connection(cid)
         if conn is not None:
             return conn
-        remote = self.api.call("getBusinessConnection", business_connection_id=cid)
+        try:
+            remote = self.api.call("getBusinessConnection", business_connection_id=cid)
+        except TelegramError as exc:
+            LOG.warning("getBusinessConnection(%s) failed: %s", cid, exc)
+            return None
         if not self.allowed_owner(remote["user"]["id"]):
             return None
         self.store.save_connection(remote)
@@ -448,12 +452,18 @@ class BusinessBot:
         if not cid or not user.get("id") or chat.get("type") != "private":
             return
         conn = self.ensure_connection(cid)
-        if not conn or not conn["enabled"] or not conn["can_reply"]:
+        if not conn or not conn["enabled"]:
+            return
+        if not conn["can_reply"]:
+            self.send(chat["id"],
+                      "⚠️ Боту не выдано право отвечать в этом чате. "
+                      "Включите «Разрешить отвечать» в настройках Business-бота.", cid)
             return
         if not self.allowed_owner(conn["owner_id"]) or user["id"] != conn["owner_id"]:
             # Stranger cannot request an offer on the owner's behalf.
             return
-        if chat.get("id") == conn["owner_id"]:
+        # Блокируем только личный чат владельца с самим собой (Saved Messages)
+        if chat.get("id") == conn["owner_id"] and chat.get("type") == "private":
             return
         try:
             parsed = parse_command(text)
