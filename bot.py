@@ -486,30 +486,50 @@ class BusinessBot:
         obj = {"url": parsed.url, "name": parsed.name,
                "number": parsed.number, "stars": parsed.stars,
                "expires_at": self.store.offer(item_id)["expires_at"]}
-        # Удаление команды и отправка оффера параллельно
-        delete_thread = threading.Thread(
-            target=self.delete_command, args=(cid, msg["message_id"]), daemon=True)
-        delete_thread.start()
-        result = None
-        for attempt in range(3):
+        # Редактируем само .mq сообщение вместо удаления + новое
+        try:
+            for custom in ([True, False] if USE_PREMIUM_EMOJI else [False]):
+                try:
+                    edit_params = {
+                        "business_connection_id": cid,
+                        "chat_id": chat["id"],
+                        "message_id": msg["message_id"],
+                        "parse_mode": "HTML",
+                        "reply_markup": keyboard(item_id, obj["url"]),
+                        "link_preview_options": {
+                            "url": obj["url"],
+                            "prefer_large_media": True,
+                            "show_above_text": True,
+                        },
+                    }
+                    try:
+                        self.api.call("editMessageText",
+                                      text=render_offer(obj, custom), **edit_params)
+                    except TelegramError as prev_exc:
+                        if not (prev_exc.code == 400 and
+                                any(w in prev_exc.description.lower()
+                                    for w in ("preview", "link preview", "media"))):
+                            raise
+                        edit_params["link_preview_options"] = {"is_disabled": True}
+                        self.api.call("editMessageText",
+                                      text=render_offer(obj, custom), **edit_params)
+                    break
+                except TelegramError as exc:
+                    if not custom or ("emoji" not in exc.description.lower()
+                                      and "entities" not in exc.description.lower()):
+                        raise
+        except TelegramError as exc:
+            LOG.warning("editMessageText failed (%s), falling back to sendMessage", exc)
             try:
                 result = self.send_rendered(chat["id"], cid, obj, item_id)
-                break
-            except TelegramError as exc:
-                if "PEER_FLOOD" in exc.description.upper():
-                    if attempt < 2:
-                        LOG.warning("PEER_FLOOD offer %d attempt %d, retry in 5s", item_id, attempt + 1)
-                        time.sleep(5)
-                        continue
-                    self.store.set_failed(item_id)
-                    LOG.error("PEER_FLOOD offer %d — все попытки исчерпаны", item_id)
-                    return
+                self.store.set_sent(item_id, result["message_id"])
+                self.delete_command(cid, msg["message_id"])
+            except TelegramError as exc2:
                 self.store.set_failed(item_id)
-                raise
-        if result is None:
+                LOG.error("offer %d failed: %s", item_id, exc2)
             return
-        self.store.set_sent(item_id, result["message_id"])
-        LOG.info("Sent simulated offer %d to chat %d", item_id, chat["id"])
+        self.store.set_sent(item_id, msg["message_id"])
+        LOG.info("Edited offer %d in chat %d", item_id, chat["id"])
 
     def callback(self, payload: dict):
         callback_id = payload.get("id", "")
