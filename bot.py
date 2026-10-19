@@ -490,16 +490,24 @@ class BusinessBot:
         delete_thread = threading.Thread(
             target=self.delete_command, args=(cid, msg["message_id"]), daemon=True)
         delete_thread.start()
-        try:
-            result = self.send_rendered(chat["id"], cid, obj, item_id)
-        except TelegramError as exc:
-            self.store.set_failed(item_id)
-            if "PEER_FLOOD" in exc.description.upper():
-                LOG.error("Telegram rejected demo offer %d with PEER_FLOOD. "
-                          "This is Telegram-side anti-spam restriction; "
-                          "no automatic retries. The .mq command is preserved.", item_id)
-                return
-            raise
+        result = None
+        for attempt in range(3):
+            try:
+                result = self.send_rendered(chat["id"], cid, obj, item_id)
+                break
+            except TelegramError as exc:
+                if "PEER_FLOOD" in exc.description.upper():
+                    if attempt < 2:
+                        LOG.warning("PEER_FLOOD offer %d attempt %d, retry in 5s", item_id, attempt + 1)
+                        time.sleep(5)
+                        continue
+                    self.store.set_failed(item_id)
+                    LOG.error("PEER_FLOOD offer %d — все попытки исчерпаны", item_id)
+                    return
+                self.store.set_failed(item_id)
+                raise
+        if result is None:
+            return
         self.store.set_sent(item_id, result["message_id"])
         LOG.info("Sent simulated offer %d to chat %d", item_id, chat["id"])
 
