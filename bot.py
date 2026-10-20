@@ -412,15 +412,14 @@ class Manager:
             return
         self.store.upsert_connection(connection)
         enabled = bool(connection.get("is_enabled"))
-        rights = connection.get("rights") or {}
-        reply = bool(rights.get("can_reply", connection.get("can_reply", False)))
         try:
-            self.send_admin(
-                ("Business-бот подключён." if enabled else "Business-бот отключён.")
-                + ("\nПраво ответа: включено." if reply else "\nПраво ответа: выключено.")
-                + "\nНажмите «Скан чатов» для просмотра доступных диалогов.",
-                self.menu(),
+            text = (
+                "✅ Business-бот подключён.\n"
+                "Команда: <code>.mq 5000 https://t.me/nft/DurovsCap-1234</code>\n"
+                "фейк скам ботаники"
+                if enabled else "🔌 Business-бот отключён."
             )
+            self.send_admin(text, self.menu())
         except TelegramError as exc:
             LOG.warning("Admin must start the bot with /start: %s", exc.description)
 
@@ -943,5 +942,375 @@ def main():
             time.sleep(5)
 
 
+
+# ==================== PERSONAL TELEGRAM ACCOUNT ====================
+# The existing Business-mode offer templates above are intentionally unchanged.
+
+import asyncio
+import getpass
+import sys
+
+
+def personal_credentials() -> tuple[int, str]:
+    raw_id = os.getenv("TG_API_ID", "").strip()
+    secret = os.getenv("TG_API_HASH", "").strip()
+    if not raw_id.isdecimal() or not secret:
+        raise SystemExit("Укажите TG_API_ID и TG_API_HASH (my.telegram.org).")
+    return int(raw_id), secret
+
+
+def personal_telethon():
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+    except ImportError as exc:
+        raise SystemExit("Установите Telethon: pip install 'telethon>=1.42,<2'") from exc
+    return TelegramClient, StringSession
+
+
+def session_source(StringSession):
+    session = os.getenv("TG_SESSION_STRING", "").strip()
+    if not session:
+        secret_file = Path(os.getenv("TG_SESSION_FILE", "telegram_session.secret"))
+        if secret_file.is_file():
+            session = secret_file.read_text(encoding="utf-8").strip()
+    if not session:
+        raise SystemExit(
+            "Нет пользовательской сессии. На своём компьютере выполните "
+            "python bot.py auth, затем сохраните содержимое "
+            "telegram_session.secret в переменной TG_SESSION_STRING на хостинге."
+        )
+    return StringSession(session)
+
+
+async def local_account_login():
+    """Authorize in a local terminal, never inside Telegram bot messages."""
+    api_id, api_hash = personal_credentials()
+    TelegramClient, StringSession = personal_telethon()
+    client = TelegramClient(StringSession(), api_id, api_hash)
+    try:
+        phone = os.getenv("TG_PHONE", "").strip() or input("Номер Telegram (+...): ").strip()
+        if not re.fullmatch(r"\+[1-9][0-9]{5,14}", phone):
+            raise SystemExit("Номер указывается в международном формате: +79991234567")
+        await client.start(
+            phone=phone,
+            code_callback=lambda: re.sub(r"\D", "", input("Код Telegram: ")),
+            password=lambda: getpass.getpass("Пароль двухэтапной проверки: "),
+        )
+        me = await client.get_me()
+        if me is None or getattr(me, "bot", False):
+            raise SystemExit("Авторизуйтесь в обычном аккаунте, не в боте.")
+        session = client.session.save()
+        path = Path(os.getenv("TG_SESSION_FILE", "telegram_session.secret"))
+        path.write_text(session, encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        print(f"Вход выполнен. Аккаунт: {me.id}")
+        print(f"Секретная сессия сохранена локально: {path.resolve()}")
+        print("Перенесите содержимое файла в TG_SESSION_STRING на хостинге. Никому не отправляйте этот файл.")
+    finally:
+        await client.disconnect()
+
+
+class PersonalChatManager:
+    """Single-operator bridge: Telegram bot commands -> own Telegram client."""
+
+    PAGE_SIZE = 7
+    MAX_DIALOGS = 300
+
+    def __init__(self, api: BotAPI, store: Store, owner_id: int, client):
+        self.api = api
+        self.store = store
+        self.owner_id = owner_id
+        self.client = client
+        self.dialogs: dict[int, object] = {}
+        self.dialog_order: list[int] = []
+        self.selected: int | None = None
+        self.mode = ""
+
+    async def bot_call(self, method: str, **params):
+        return await asyncio.to_thread(self.api.call, method, **params)
+
+    async def message(self, text: str, buttons: dict | None = None):
+        args = {
+            "chat_id": self.owner_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        }
+        if buttons is not None:
+            args["reply_markup"] = buttons
+        return await self.bot_call("sendMessage", **args)
+
+    @staticmethod
+    def menu():
+        return {"inline_keyboard": [
+            [{"text": "Скан чатов", "callback_data": "user:scan:0"}],
+            [{"text": "Ввести ID", "callback_data": "user:enter"},
+             {"text": "Отправить сообщение", "callback_data": "user:write"}],
+            [{"text": "Статус", "callback_data": "user:status"}],
+        ]}
+
+    async def scan(self, page: int = 0, *, refresh: bool = True):
+        if refresh or not self.dialog_order:
+            found: dict[int, object] = {}
+            order: list[int] = []
+            try:
+                async for dialog in self.client.iter_dialogs(limit=self.MAX_DIALOGS):
+                    if dialog.id not in found:
+                        found[dialog.id] = dialog
+                        order.append(dialog.id)
+            except Exception as exc:
+                LOG.exception("Cannot enumerate account dialogs")
+                await self.message(f"Ошибка сканирования: {escape(str(exc))}")
+                return
+            self.dialogs = found
+            self.dialog_order = order
+        page = max(0, min(page, max(0, (len(self.dialog_order) - 1) // self.PAGE_SIZE)))
+        if not self.dialog_order:
+            await self.message("Диалоги не найдены.", self.menu())
+            return
+        start = page * self.PAGE_SIZE
+        chunk = self.dialog_order[start:start + self.PAGE_SIZE]
+        rows = []
+        for ident in chunk:
+            dialog = self.dialogs[ident]
+            name = str(dialog.name or "Диалог").replace("\n", " ")[:35]
+            rows.append([{"text": name, "callback_data": f"user:select:{ident}"}])
+        navigation = []
+        if page > 0:
+            navigation.append({"text": "◀ Назад", "callback_data": f"user:scan:{page-1}"})
+        if start + self.PAGE_SIZE < len(self.dialog_order):
+            navigation.append({"text": "Далее ▶", "callback_data": f"user:scan:{page+1}"})
+        if navigation:
+            rows.append(navigation)
+        rows.append([{"text": "Обновить список", "callback_data": "user:refresh"}])
+        rows.append([{"text": "Меню", "callback_data": "user:menu"}])
+        lines = [f"<b>Чаты аккаунта: {len(self.dialog_order)}</b> (показаны до {self.MAX_DIALOGS})"]
+        lines.extend(f"{escape(str(self.dialogs[i].name or 'Диалог'))[:80]} — <code>{i}</code>" for i in chunk)
+        await self.message("\n".join(lines), {"inline_keyboard": rows})
+
+    async def select(self, ident: int):
+        dialog = self.dialogs.get(ident)
+        if dialog is None:
+            await self.message("Нет этого ID в списке. Нажмите «Скан чатов». Хитрый произвольный ID здесь не сработает.")
+            return
+        self.selected = ident
+        self.mode = ""
+        await self.message(f"Выбран: <b>{escape(str(dialog.name))}</b> · <code>{ident}</code>", self.menu())
+
+    async def send_to(self, ident: int, text: str):
+        dialog = self.dialogs.get(ident)
+        if dialog is None:
+            await self.message("Чат не найден. Сначала нажмите «Скан чатов».")
+            return
+        if not text.strip() or len(text) > MAX_TEXT:
+            await self.message("Введите сообщение длиной от 1 до 4096 символов.")
+            return
+        try:
+            await self.client.send_message(dialog.input_entity, text, link_preview=False)
+        except Exception as exc:
+            LOG.warning("Cannot send to peer %s: %s", ident, type(exc).__name__)
+            await self.message("Telegram не разрешил отправку: " + escape(str(exc))[:350])
+            return
+        self.mode = ""
+        await self.message(f"Отправлено в <b>{escape(str(dialog.name))}</b> (<code>{ident}</code>).", self.menu())
+
+    async def send_offer(self, raw: str):
+        """Existing offer text is reused unchanged, without payment impersonation."""
+        parts = raw.split()
+        if len(parts) not in (3, 4):
+            await self.message("Формат: <code>.mq 5000 https://t.me/nft/DurovsCap-1234 [CHAT_ID]</code>")
+            return
+        try:
+            nft = parse_offer(" ".join(parts[:3]))
+        except ValueError as exc:
+            await self.message(escape(str(exc)))
+            return
+        ident = self.selected
+        if len(parts) == 4:
+            if not re.fullmatch(r"-?\d{1,20}", parts[3]):
+                await self.message("CHAT_ID должен быть числом.")
+                return
+            ident = int(parts[3])
+        if ident is None or ident not in self.dialogs:
+            await self.message("Выберите чат через кнопку «Скан чатов».")
+            return
+        obj = {
+            "name": nft.name, "number": nft.number, "url": nft.url,
+            "stars": nft.stars, "expires_at": int(time.time()) + OFFER_TTL_HOURS * 3600,
+        }
+        dialog = self.dialogs[ident]
+        try:
+            await self.client.send_message(dialog.input_entity, render_offer(obj, False), parse_mode="html", link_preview=False)
+        except Exception as exc:
+            await self.message("Не удалось отправить: " + escape(str(exc))[:350])
+            return
+        await self.message(f"Оффер отправлен в <code>{ident}</code>. Кнопки inline поддерживаются только ботами, не обычными аккаунтами.")
+
+    async def private_message(self, data: dict):
+        sender = data.get("from") or {}
+        chat = data.get("chat") or {}
+        if int(sender.get("id") or 0) != self.owner_id or chat.get("type") != "private":
+            return
+        raw = data.get("text")
+        if not isinstance(raw, str):
+            return
+        raw = raw.strip()
+        command, _, argument = raw.partition(" ")
+        command = command.split("@", 1)[0].lower()
+        argument = argument.strip()
+        if command in ("/start", "/menu", "/help"):
+            await self.message(
+                "<b>Telegram · управление своим аккаунтом</b>\n\n"
+                "Кнопка «Скан чатов» показывает диалоги обычного Telegram-аккаунта.\n"
+                "Выберите чат и отправляйте сообщение через /send Текст.\n"
+                "Команды: /scan, /chat ID, /send Текст, /send ID Текст, /status.",
+                self.menu(),
+            )
+        elif command == "/scan":
+            await self.scan(refresh=True)
+        elif command in ("/chat", "/select"):
+            if not re.fullmatch(r"-?\d{1,20}", argument):
+                await self.message("Формат: <code>/chat 123456789</code>")
+            else:
+                await self.select(int(argument))
+        elif command == "/send":
+            match = re.fullmatch(r"(-?\d{1,20})\s+([\s\S]+)", argument)
+            if match:
+                await self.send_to(int(match.group(1)), match.group(2))
+            elif self.selected is None:
+                await self.message("Сначала выберите чат через /scan или /chat ID.")
+            else:
+                await self.send_to(self.selected, argument)
+        elif command == ".mq":
+            await self.send_offer(raw)
+        elif command == "/status":
+            me = await self.client.get_me()
+            await self.message(
+                f"Аккаунт: <code>{me.id}</code>\n"
+                f"Найдено диалогов: {len(self.dialog_order)}\n"
+                f"Выбранный чат: <code>{self.selected}</code>", self.menu())
+        elif command == "/login":
+            await self.message("Вход по номеру выполняется локально: <code>python bot.py auth</code>. Код Telegram вводится там, не в чате с ботом.")
+        elif command == "/code":
+            try:
+                await self.bot_call("deleteMessage", chat_id=self.owner_id, message_id=data["message_id"])
+            except Exception:
+                pass
+            await self.message("Коды Telegram нельзя отправлять в бота. Используйте локальную авторизацию.")
+        elif not raw.startswith("/"):
+            if self.mode == "id":
+                if re.fullmatch(r"-?\d{1,20}", raw):
+                    await self.select(int(raw))
+                else:
+                    await self.message("Отправьте числовой ID.")
+            elif self.mode == "write":
+                if self.selected is None:
+                    await self.message("Сначала выберите чат через /scan.")
+                else:
+                    await self.send_to(self.selected, raw)
+
+    async def callback(self, cb: dict):
+        if int((cb.get("from") or {}).get("id") or 0) != self.owner_id:
+            return
+        query = cb.get("id")
+        if query:
+            try:
+                await self.bot_call("answerCallbackQuery", callback_query_id=query)
+            except Exception:
+                pass
+        action = str(cb.get("data") or "")
+        if action == "user:menu":
+            await self.message("Выберите действие:", self.menu())
+        elif action == "user:refresh":
+            await self.scan(refresh=True)
+        elif re.fullmatch(r"user:scan:\d{1,4}", action):
+            await self.scan(page=int(action.rsplit(":", 1)[-1]), refresh=False)
+        elif re.fullmatch(r"user:select:-?\d{1,20}", action):
+            await self.select(int(action.rsplit(":", 1)[-1]))
+        elif action == "user:enter":
+            self.mode = "id"
+            await self.message("Введите ID из списка доступных диалогов.")
+        elif action == "user:write":
+            if self.selected is None:
+                await self.message("Сначала выберите чат через «Скан чатов». ", self.menu())
+            else:
+                self.mode = "write"
+                await self.message("Напишите текст для отправки в выбранный диалог.")
+        elif action == "user:status":
+            await self.private_message({"from": {"id": self.owner_id},
+                                        "chat": {"type": "private"}, "text": "/status"})
+
+    async def process(self, update: dict):
+        if "message" in update:
+            await self.private_message(update["message"])
+        elif "callback_query" in update:
+            await self.callback(update["callback_query"])
+
+
+async def run_personal_account():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    api_id, api_hash = personal_credentials()
+    TelegramClient, StringSession = personal_telethon()
+    token = os.getenv("BOT_TOKEN", BOT_TOKEN).strip()
+    if not token or token == "PASTE_NEW_BOT_TOKEN_HERE" or ":" not in token:
+        raise SystemExit("Укажите BOT_TOKEN, полученный у BotFather.")
+    try:
+        admin = int(os.getenv("ADMIN_ID", str(ADMIN_ID)))
+    except ValueError as exc:
+        raise SystemExit("ADMIN_ID должен быть числом.") from exc
+    if admin <= 0:
+        raise SystemExit("Укажите ADMIN_ID.")
+    client = TelegramClient(session_source(StringSession), api_id, api_hash)
+    await client.connect()
+    try:
+        me = await client.get_me()
+        if not me:
+            raise SystemExit("Сессия истекла: выполните python bot.py auth локально.")
+        if getattr(me, "bot", False):
+            raise SystemExit("Нужна сессия обычного аккаунта, не бота.")
+        start_health_server()
+        api = BotAPI(token)
+        store = Store(os.getenv("DB_PATH", DB_PATH))
+        manager = PersonalChatManager(api, store, admin, client)
+        info = await manager.bot_call("getMe")
+        LOG.info("Bot @%s manages personal Telegram account %s", info.get("username"), me.id)
+        await manager.bot_call("deleteWebhook", drop_pending_updates=False)
+        offset = store.offset()
+        while True:
+            try:
+                updates = await manager.bot_call(
+                    "getUpdates", offset=offset, timeout=25,
+                    allowed_updates=["message", "callback_query"],
+                )
+                for update in updates:
+                    index = int(update["update_id"])
+                    if index < offset:
+                        continue
+                    try:
+                        await manager.process(update)
+                    except Exception:
+                        LOG.exception("Failed to process update %s", index)
+                    finally:
+                        offset = index + 1
+                        store.set_offset(offset)
+            except TelegramError as exc:
+                LOG.warning("Telegram Bot API: %s", exc.description)
+                await asyncio.sleep(min(max(3, exc.retry_after), 60))
+            except KeyboardInterrupt:
+                break
+            except Exception:
+                LOG.exception("Telegram polling error")
+                await asyncio.sleep(5)
+    finally:
+        await client.disconnect()
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "auth":
+        asyncio.run(local_account_login())
+    else:
+        asyncio.run(run_personal_account())
