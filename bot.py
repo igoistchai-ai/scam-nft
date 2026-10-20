@@ -964,40 +964,30 @@ def personal_credentials() -> tuple[int, str]:
 def personal_telethon():
     try:
         from telethon import TelegramClient
-        from telethon.sessions import StringSession
     except ImportError:
-        # Single-file deployment: install the dependency when it is missing.
         import subprocess
         print("Telethon не найден. Устанавливаю telethon>=1.42,<2 ...", flush=True)
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "telethon>=1.42,<2"])
             from telethon import TelegramClient
-            from telethon.sessions import StringSession
         except (subprocess.CalledProcessError, ImportError) as exc:
             raise SystemExit("Не удалось установить Telethon. Проверьте доступ к pip.") from exc
-    return TelegramClient, StringSession
+    return TelegramClient
 
 
-def session_source(StringSession):
-    session = os.getenv("TG_SESSION_STRING", "").strip()
-    if not session:
-        secret_file = Path(os.getenv("TG_SESSION_FILE", "telegram_session.secret"))
-        if secret_file.is_file():
-            session = secret_file.read_text(encoding="utf-8").strip()
-    if not session:
-        raise SystemExit(
-            "Нет пользовательской сессии. На своём компьютере выполните "
-            "python bot.py auth, затем сохраните содержимое "
-            "telegram_session.secret в переменной TG_SESSION_STRING на хостинге."
-        )
-    return StringSession(session)
+def session_source() -> str:
+    """Local SQLite session file, not a required environment string."""
+    source = os.getenv("TG_SESSION_PATH", "telegram_account").strip() or "telegram_account"
+    path = Path(source).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 async def local_account_login():
-    """Authorize in a local terminal, never inside Telegram bot messages."""
+    """Authorize locally; never submit Telegram verification codes to a bot."""
     api_id, api_hash = personal_credentials()
-    TelegramClient, StringSession = personal_telethon()
-    client = TelegramClient(StringSession(), api_id, api_hash)
+    TelegramClient = personal_telethon()
+    client = TelegramClient(session_source(), api_id, api_hash)
     try:
         phone = os.getenv("TG_PHONE", "").strip() or input("Номер Telegram (+...): ").strip()
         if not re.fullmatch(r"\+[1-9][0-9]{5,14}", phone):
@@ -1010,16 +1000,16 @@ async def local_account_login():
         me = await client.get_me()
         if me is None or getattr(me, "bot", False):
             raise SystemExit("Авторизуйтесь в обычном аккаунте, не в боте.")
-        session = client.session.save()
-        path = Path(os.getenv("TG_SESSION_FILE", "telegram_session.secret"))
-        path.write_text(session, encoding="utf-8")
+        filename = Path(session_source())
+        if filename.suffix != ".session":
+            filename = filename.with_name(filename.name + ".session")
         try:
-            os.chmod(path, 0o600)
+            os.chmod(filename, 0o600)
         except OSError:
             pass
         print(f"Вход выполнен. Аккаунт: {me.id}")
-        print(f"Секретная сессия сохранена локально: {path.resolve()}")
-        print("Перенесите содержимое файла в TG_SESSION_STRING на хостинге. Никому не отправляйте этот файл.")
+        print(f"Сессия сохранена: {filename.resolve()}")
+        print("Храните файл в закрытой папке. Для Render необходим постоянный диск (Persistent Disk).")
     finally:
         await client.disconnect()
 
@@ -1172,6 +1162,22 @@ class PersonalChatManager:
         command, _, argument = raw.partition(" ")
         command = command.split("@", 1)[0].lower()
         argument = argument.strip()
+        if command == "/code":
+            try:
+                await self.bot_call("deleteMessage", chat_id=self.owner_id, message_id=data["message_id"])
+            except Exception:
+                pass
+            await self.message("Код подтверждения вводится в личном терминале при python bot.py auth, не в чате бота.")
+            return
+        if not await self.client.is_user_authorized():
+            await self.message(
+                "Аккаунт ещё не подключён. Чтобы войти по номеру, запустите "
+                "<code>python bot.py auth</code> в терминале сервера. "
+                "Введите свой номер, код Telegram и, если потребуется, пароль. "
+                "После входа перезапустите сервис. "
+                "Файл авторизации сохраняется автоматически."
+            )
+            return
         if command in ("/start", "/menu", "/help"):
             await self.message(
                 "<b>Telegram · управление своим аккаунтом</b>\n\n"
@@ -1204,13 +1210,7 @@ class PersonalChatManager:
                 f"Найдено диалогов: {len(self.dialog_order)}\n"
                 f"Выбранный чат: <code>{self.selected}</code>", self.menu())
         elif command == "/login":
-            await self.message("Вход по номеру выполняется локально: <code>python bot.py auth</code>. Код Telegram вводится там, не в чате с ботом.")
-        elif command == "/code":
-            try:
-                await self.bot_call("deleteMessage", chat_id=self.owner_id, message_id=data["message_id"])
-            except Exception:
-                pass
-            await self.message("Коды Telegram нельзя отправлять в бота. Используйте локальную авторизацию.")
+            await self.message("Вход по номеру: <code>python bot.py auth</code> в терминале. Код Telegram вводится только там.")
         elif not raw.startswith("/"):
             if self.mode == "id":
                 if re.fullmatch(r"-?\d{1,20}", raw):
@@ -1232,6 +1232,9 @@ class PersonalChatManager:
                 await self.bot_call("answerCallbackQuery", callback_query_id=query)
             except Exception:
                 pass
+        if not await self.client.is_user_authorized():
+            await self.message("Сначала авторизуйте аккаунт по номеру: python bot.py auth в терминале и перезапустите сервис.")
+            return
         action = str(cb.get("data") or "")
         if action == "user:menu":
             await self.message("Выберите действие:", self.menu())
@@ -1264,7 +1267,7 @@ class PersonalChatManager:
 async def run_personal_account():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     api_id, api_hash = personal_credentials()
-    TelegramClient, StringSession = personal_telethon()
+    TelegramClient = personal_telethon()
     token = os.getenv("BOT_TOKEN", BOT_TOKEN).strip()
     if not token or token == "PASTE_NEW_BOT_TOKEN_HERE" or ":" not in token:
         raise SystemExit("Укажите BOT_TOKEN, полученный у BotFather.")
@@ -1274,20 +1277,23 @@ async def run_personal_account():
         raise SystemExit("ADMIN_ID должен быть числом.") from exc
     if admin <= 0:
         raise SystemExit("Укажите ADMIN_ID.")
-    client = TelegramClient(session_source(StringSession), api_id, api_hash)
+    client = TelegramClient(session_source(), api_id, api_hash)
     await client.connect()
     try:
         me = await client.get_me()
-        if not me:
-            raise SystemExit("Сессия истекла: выполните python bot.py auth локально.")
-        if getattr(me, "bot", False):
+        if me is not None and getattr(me, "bot", False):
             raise SystemExit("Нужна сессия обычного аккаунта, не бота.")
+        if me is None:
+            LOG.warning("Аккаунт не авторизован: выполните python bot.py auth в терминале на этом сервере, затем перезапустите сервис.")
         start_health_server()
         api = BotAPI(token)
         store = Store(os.getenv("DB_PATH", DB_PATH))
         manager = PersonalChatManager(api, store, admin, client)
         info = await manager.bot_call("getMe")
-        LOG.info("Bot @%s manages personal Telegram account %s", info.get("username"), me.id)
+        if me:
+            LOG.info("Bot @%s manages personal Telegram account %s", info.get("username"), me.id)
+        else:
+            LOG.info("Bot @%s ждёт авторизации личного Telegram-аккаунта", info.get("username"))
         await manager.bot_call("deleteWebhook", drop_pending_updates=False)
         offset = store.offset()
         while True:
