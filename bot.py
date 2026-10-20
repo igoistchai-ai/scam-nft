@@ -11,7 +11,7 @@ from __future__ import annotations
 
 # ======================= SETTINGS =======================
 # Rotate any BotFather token that has been shared in screenshots or chats.
-BOT_TOKEN = "PASTE_NEW_BOT_TOKEN_HERE"
+BOT_TOKEN = "8731504349:AAGTIGZz3nsBdLMF94zQiP5zsQLHF4wgsEA"
 ADMIN_ID = 8357023784
 TG_API_ID = 9619937
 TG_API_HASH = "e00356ba07ec98314a5c6abcc0ec7899"
