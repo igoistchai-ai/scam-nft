@@ -91,6 +91,10 @@ def verify_telegram(data: dict[str, str]) -> dict | None:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Do not log one-time paths or Telegram query signatures.
+        logging.info("web request completed")
+
     def respond(self, code: int, body: bytes, content_type: str = "text/html; charset=utf-8") -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
@@ -143,6 +147,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.redirect("/?error=auth")
                 return
             self.redirect("/", sign_session(user))
+            return
+        if parsed.path.startswith("/auth/"):
+            # Personal-account Telethon links belong to a different app.
+            # Do not forward Telegram codes or 2FA passwords to this site.
+            self.respond(409, ("""<!doctype html><html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Другой способ входа</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;
+font:16px system-ui;color:#f1f4ff;background:radial-gradient(circle at 20% 20%,#214b55,#0b1121 65%)}
+main{max-width:480px;padding:36px;border-radius:24px;background:#ffffff12;
+backdrop-filter:blur(24px);border:1px solid #ffffff30;box-shadow:0 12px 44px #0005}
+h1{font-size:24px}p{line-height:1.7;color:#d7ddeb}a{display:inline-block;padding:14px 18px;
+background:#88dcca;color:#061d22;border-radius:12px;text-decoration:none;font-weight:700}</style>
+</head><body><main><h1>Ссылка от другой системы входа</h1>
+<p>Эта ссылка создана менеджером чатов, но данный сайт поддерживает официальный Telegram Login.
+Он не запрашивает коды подтверждения или облачные пароли и не предоставляет доступ к личным чатам.</p>
+<a href="/">Открыть страницу входа</a></main></body></html>""").encode("utf-8"))
             return
         if parsed.path not in ("/", "/index.html"):
             self.respond(404, b"Not found", "text/plain; charset=utf-8")
