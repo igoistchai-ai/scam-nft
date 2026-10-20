@@ -18,6 +18,8 @@ from __future__ import annotations
 # Rotate any BotFather token that has been shared in screenshots or chats.
 BOT_TOKEN = "8731504349:AAGTIGZz3nsBdLMF94zQiP5zsQLHF4wgsEA"
 ADMIN_ID = 8357023784
+TG_API_ID = 9619937
+TG_API_HASH = "e00356ba07ec98314a5c6abcc0ec7899"
 DB_PATH = "business_chats.sqlite3"
 # Render Web Service requires a bound PORT (usually 10000).
 # Set PORT=0 when deploying as a Render Background Worker.
@@ -952,10 +954,10 @@ import sys
 
 
 def personal_credentials() -> tuple[int, str]:
-    raw_id = os.getenv("TG_API_ID", "").strip()
-    secret = os.getenv("TG_API_HASH", "").strip()
+    raw_id = os.getenv("TG_API_ID", str(TG_API_ID)).strip()
+    secret = os.getenv("TG_API_HASH", TG_API_HASH).strip()
     if not raw_id.isdecimal() or not secret:
-        raise SystemExit("Укажите TG_API_ID и TG_API_HASH (my.telegram.org).")
+        raise SystemExit("Проверьте TG_API_ID и TG_API_HASH в настройках bot.py.")
     return int(raw_id), secret
 
 
@@ -963,8 +965,16 @@ def personal_telethon():
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
-    except ImportError as exc:
-        raise SystemExit("Установите Telethon: pip install 'telethon>=1.42,<2'") from exc
+    except ImportError:
+        # Single-file deployment: install the dependency when it is missing.
+        import subprocess
+        print("Telethon не найден. Устанавливаю telethon>=1.42,<2 ...", flush=True)
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "telethon>=1.42,<2"])
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+        except (subprocess.CalledProcessError, ImportError) as exc:
+            raise SystemExit("Не удалось установить Telethon. Проверьте доступ к pip.") from exc
     return TelegramClient, StringSession
 
 
