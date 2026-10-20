@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Telegram Business chat manager. Python 3.10+, standard library only.
+"""Telegram account manager with private web sign-in. Python 3.10+.
 
-The bot indexes only chats received through authorized Telegram Business
-updates. Telegram Bot API cannot list all chats of a personal account.
-
-Commands (admin only):
-/start, /scan, /chat CHAT_ID, /send MESSAGE, /send CHAT_ID MESSAGE, /status
-.mq STARS NFT_URL [CHAT_ID] creates an unpaid NFT offer in an authorized chat.
-
-No Telegram account verification codes are collected or stored.
+Admin commands: /login +number, /scan, /chat ID, /send TEXT, /status.
+One-time HTTPS sign-in pages replace sending Telegram codes to a bot.
+Telethon login session is saved locally; Render needs a persistent disk.
 """
 
 from __future__ import annotations
@@ -951,6 +946,8 @@ def main():
 import asyncio
 import getpass
 import sys
+import secrets
+from urllib.parse import parse_qs
 
 
 def personal_credentials() -> tuple[int, str]:
@@ -1029,6 +1026,8 @@ class PersonalChatManager:
         self.dialog_order: list[int] = []
         self.selected: int | None = None
         self.mode = ""
+        self.login_flow: dict | None = None
+        self.last_login_request = 0.0
 
     async def bot_call(self, method: str, **params):
         return await asyncio.to_thread(self.api.call, method, **params)
@@ -1043,6 +1042,132 @@ class PersonalChatManager:
         if buttons is not None:
             args["reply_markup"] = buttons
         return await self.bot_call("sendMessage", **args)
+
+    @staticmethod
+    def login_url(token: str) -> str | None:
+        base = (os.getenv("PUBLIC_BASE_URL", "").strip()
+                or os.getenv("RENDER_EXTERNAL_URL", "").strip())
+        if not base:
+            hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
+            if hostname:
+                base = "https://" + hostname
+        base = base.rstrip("/")
+        # Never send authorization links over cleartext HTTP.
+        if not base.startswith("https://") or any(x in base for x in ("?", "#", "@")):
+            return None
+        return base + "/auth/" + token
+
+    async def begin_login(self, phone: str):
+        if not re.fullmatch(r"\+[1-9][0-9]{5,14}", phone):
+            await self.message("Формат: <code>/login +79991234567</code>")
+            return
+        if await self.client.is_user_authorized():
+            me = await self.client.get_me()
+            await self.message(f"Аккаунт уже подключён: <code>{me.id}</code>. Откройте «Скан чатов».", self.menu())
+            return
+        if time.monotonic() - self.last_login_request < 60:
+            await self.message("Повторный запрос кода возможен не чаще одного раза в минуту.")
+            return
+        self.last_login_request = time.monotonic()
+        try:
+            sent = await self.client.send_code_request(phone)
+        except Exception as exc:
+            LOG.warning("Telegram login code request failed: %s", type(exc).__name__)
+            await self.message("Не удалось запросить код: " + escape(str(exc))[:250])
+            return
+        token = secrets.token_urlsafe(32)
+        self.login_flow = {
+            "token": token, "phone": phone, "phone_code_hash": sent.phone_code_hash,
+            "stage": "code", "expires": time.monotonic() + 600, "attempts": 0,
+        }
+        url = self.login_url(token)
+        if url:
+            await self.message(
+                "Код Telegram отправлен. Откройте одноразовую страницу для подтверждения входа. "
+                "Не пересылайте ссылку другим. Она действительна 10 минут.\n\n"
+                f'<a href="{escape(url, quote=True)}">Открыть защищённую страницу входа</a>',
+                {"inline_keyboard": [[{"text": "Открыть страницу входа", "url": url}]]},
+            )
+        else:
+            await self.message(
+                "Код отправлен. Откройте HTTPS-адрес своего Render-сервиса "
+                "и добавьте следующий путь:\n"
+                f"<code>/auth/{escape(token)}</code>\n\n"
+                "Для автоматической кнопки задайте PUBLIC_BASE_URL "
+                "равным HTTPS-адресу сервиса. Ссылка действует 10 минут."
+            )
+
+    async def get_login_stage(self, token: str) -> str | None:
+        flow = self.login_flow
+        if not flow or not secrets.compare_digest(str(flow["token"]), token):
+            return None
+        if time.monotonic() > flow["expires"]:
+            self.login_flow = None
+            return None
+        return str(flow["stage"])
+
+    async def submit_login(self, token: str, submitted: str) -> tuple[str, str]:
+        flow = self.login_flow
+        if not flow or not secrets.compare_digest(str(flow["token"]), token):
+            return "invalid", "Ссылка недействительна. Запросите /login заново."
+        if time.monotonic() > flow["expires"] or flow["attempts"] >= 5:
+            self.login_flow = None
+            return "invalid", "Время подтверждения вышло. Запросите /login заново."
+        flow["attempts"] += 1
+        stage = flow["stage"]
+        try:
+            if stage == "code":
+                code = re.sub(r"\D", "", submitted)
+                if not 4 <= len(code) <= 8:
+                    return "code", "Введите код из сообщения Telegram. Точки и пробелы допускаются."
+                await self.client.sign_in(
+                    phone=flow["phone"], code=code,
+                    phone_code_hash=flow["phone_code_hash"])
+            elif stage == "password":
+                if not 1 <= len(submitted) <= 256:
+                    return "password", "Введите пароль двухэтапной проверки."
+                await self.client.sign_in(password=submitted)
+            else:
+                return "invalid", "Ссылка больше не действует."
+        except Exception as exc:
+            from telethon.errors import (SessionPasswordNeededError, PhoneCodeInvalidError,
+                                         PhoneCodeExpiredError, PasswordHashInvalidError,
+                                         FloodWaitError)
+            if isinstance(exc, SessionPasswordNeededError):
+                flow["stage"] = "password"
+                flow["attempts"] = 0
+                return "password", "Теперь введите облачный пароль Telegram."
+            if isinstance(exc, (PhoneCodeInvalidError, PasswordHashInvalidError)):
+                if flow["attempts"] >= 5:
+                    self.login_flow = None
+                    return "invalid", "Слишком много попыток. Повторите /login."
+                return stage, "Неверный код или пароль. Попробуйте снова."
+            if isinstance(exc, PhoneCodeExpiredError):
+                self.login_flow = None
+                return "invalid", "Код просрочен. Запросите /login заново."
+            if isinstance(exc, FloodWaitError):
+                self.login_flow = None
+                return "invalid", f"Telegram ограничил вход. Повторите через {exc.seconds} сек."
+            LOG.warning("Telegram sign-in failed: %s", type(exc).__name__)
+            return stage, "Ошибка авторизации. Проверьте данные и попробуйте снова."
+        me = await self.client.get_me()
+        if me is None or getattr(me, "bot", False):
+            self.login_flow = None
+            return "invalid", "Не удалось подтвердить обычный аккаунт."
+        self.login_flow = None
+        file = Path(session_source())
+        if file.suffix != ".session":
+            file = file.with_name(file.name + ".session")
+        try:
+            os.chmod(file, 0o600)
+        except OSError:
+            pass
+        try:
+            await self.message(
+                f"Аккаунт <code>{me.id}</code> подключён. Нажмите «Скан чатов».", self.menu())
+        except Exception:
+            LOG.warning("Login completed, but bot DM notification failed")
+        return "success", "Аккаунт подключён. Вернитесь в бот и нажмите «Скан чатов»."
 
     @staticmethod
     def menu():
@@ -1162,20 +1287,24 @@ class PersonalChatManager:
         command, _, argument = raw.partition(" ")
         command = command.split("@", 1)[0].lower()
         argument = argument.strip()
-        if command == "/code":
+        if command in ("/code", "/password"):
             try:
-                await self.bot_call("deleteMessage", chat_id=self.owner_id, message_id=data["message_id"])
+                await self.bot_call("deleteMessage", chat_id=self.owner_id,
+                                    message_id=data["message_id"])
             except Exception:
                 pass
-            await self.message("Код подтверждения вводится в личном терминале при python bot.py auth, не в чате бота.")
+            await self.message("Коды и пароли не отправляйте в бот. "
+                               "Для входа используйте одноразовую HTTPS-страницу, "
+                               "ссылку на которую выдаёт /login +номер.")
+            return
+        if command == "/login":
+            await self.begin_login(argument)
             return
         if not await self.client.is_user_authorized():
             await self.message(
-                "Аккаунт ещё не подключён. Чтобы войти по номеру, запустите "
-                "<code>python bot.py auth</code> в терминале сервера. "
-                "Введите свой номер, код Telegram и, если потребуется, пароль. "
-                "После входа перезапустите сервис. "
-                "Файл авторизации сохраняется автоматически."
+                "Аккаунт ещё не подключён. Введите <code>/login +79991234567</code>. "
+                "Бот запросит код Telegram и отправит одноразовую ссылку на страницу "
+                "подтверждения. Войдите через неё, затем используйте «Скан чатов»."
             )
             return
         if command in ("/start", "/menu", "/help"):
@@ -1183,7 +1312,7 @@ class PersonalChatManager:
                 "<b>Telegram · управление своим аккаунтом</b>\n\n"
                 "Кнопка «Скан чатов» показывает диалоги обычного Telegram-аккаунта.\n"
                 "Выберите чат и отправляйте сообщение через /send Текст.\n"
-                "Команды: /scan, /chat ID, /send Текст, /send ID Текст, /status.",
+                "Команды: /login +номер, /scan, /chat ID, /send Текст, /send ID Текст, /status.",
                 self.menu(),
             )
         elif command == "/scan":
@@ -1209,8 +1338,6 @@ class PersonalChatManager:
                 f"Аккаунт: <code>{me.id}</code>\n"
                 f"Найдено диалогов: {len(self.dialog_order)}\n"
                 f"Выбранный чат: <code>{self.selected}</code>", self.menu())
-        elif command == "/login":
-            await self.message("Вход по номеру: <code>python bot.py auth</code> в терминале. Код Telegram вводится только там.")
         elif not raw.startswith("/"):
             if self.mode == "id":
                 if re.fullmatch(r"-?\d{1,20}", raw):
@@ -1233,7 +1360,7 @@ class PersonalChatManager:
             except Exception:
                 pass
         if not await self.client.is_user_authorized():
-            await self.message("Сначала авторизуйте аккаунт по номеру: python bot.py auth в терминале и перезапустите сервис.")
+            await self.message("Сначала выполните <code>/login +номер</code> и подтвердите вход на одноразовой странице.")
             return
         action = str(cb.get("data") or "")
         if action == "user:menu":
@@ -1264,6 +1391,147 @@ class PersonalChatManager:
             await self.callback(update["callback_query"])
 
 
+class PersonalLoginHandler(BaseHTTPRequestHandler):
+    # One-time-link login portal. HTTPS terminated by Render proxy.
+
+    def log_message(self, fmt, *args):
+        # Never log paths containing auth tokens or confidential POST bodies.
+        pass
+
+    def respond(self, status: int, html_text: str, *, cookie: str | None = None):
+        body = html_text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def html_page(self, stage: str, token: str, alert: str = "") -> str:
+        safe_alert = escape(alert)
+        if stage == "success":
+            form = '<div class="ok">Вход подтверждён. Вернитесь в Telegram-бот.</div>'
+        elif stage == "invalid":
+            form = '<div class="error">Ссылка истекла или недействительна. Отправьте /login в бот.</div>'
+        else:
+            password = stage == "password"
+            label = "Облачный пароль Telegram" if password else "Код из Telegram"
+            placeholder = "Введите пароль" if password else "Например, 1.2.3.4.5"
+            typ = "password" if password else "text"
+            name = "secret"
+            form = (f'<form method="post" action="/auth/{escape(token, quote=True)}">'
+                    f'<label>{label}</label>'
+                    f'<input name="{name}" type="{typ}" autocomplete="off" '
+                    f'placeholder="{placeholder}" minlength="1" maxlength="256" required autofocus>'
+                    '<button type="submit">Подтвердить вход</button></form>')
+        alert_html = f'<div class="note">{safe_alert}</div>' if alert else ""
+        return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Авторизация своего Telegram-аккаунта</title>
+<style>
+:root{{color-scheme:dark}}*{{box-sizing:border-box}}
+body{{background:#10151f;color:#e8ecf3;font-family:system-ui,Arial,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;padding:18px}}
+main{{max-width:450px;width:100%;background:#192231;border:1px solid #374456;border-radius:20px;padding:30px;box-shadow:0 10px 40px #0004}}
+h1{{font-size:23px;margin:0 0 15px}}p{{line-height:1.5;color:#aabbd0;font-size:14px}}
+label{{display:block;font-weight:600;margin:24px 0 9px}}
+input{{width:100%;padding:14px;border-radius:10px;background:#121923;border:1px solid #586779;color:white;font-size:17px}}
+button{{width:100%;padding:14px;border:0;border-radius:10px;background:#3899ee;color:#07101d;font-weight:750;font-size:16px;margin-top:18px;cursor:pointer}}
+.note,.ok,.error{{margin-top:17px;padding:12px;border-radius:9px;background:#273e56;font-size:14px}}
+.ok{{background:#17392d}}.error{{background:#512629}}
+small{{display:block;margin-top:24px;color:#95a9c3;line-height:1.6}}
+</style></head><body><main><h1>Подключение Telegram-аккаунта</h1>
+<p>Приватная страница вашего собственного менеджера чатов. Не является официальным сайтом Telegram. Не пересылайте эту ссылку.</p>
+{alert_html}{form}
+<small>Эта страница действует 10 минут. Введённые данные передаются только вашему серверу через HTTPS и не сохраняются в базе или переписке с ботом.</small>
+</main></body></html>'''
+
+    def get_token(self):
+        match = re.fullmatch(r"/auth/([A-Za-z0-9_-]{35,70})", urlsplit(self.path).path)
+        return match.group(1) if match else None
+
+    def call_loop(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self.server.bot_loop).result(timeout=45)
+
+    def do_GET(self):
+        if urlsplit(self.path).path in ("/", "/health", "/healthz"):
+            body = b'{"ok":true,"service":"telegram-personal-manager"}\n'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        token = self.get_token()
+        if token is None:
+            self.send_error(404)
+            return
+        try:
+            stage = self.call_loop(self.server.login_manager.get_login_stage(token))
+        except Exception:
+            self.send_error(503)
+            return
+        self.respond(200 if stage else 410,
+                     self.html_page(stage or "invalid", token))
+
+    def do_POST(self):
+        token = self.get_token()
+        if token is None:
+            self.send_error(404)
+            return
+        # Explicit same-origin check against off-site form submissions.
+        origin = self.headers.get("Origin", "")
+        host = self.headers.get("Host", "")
+        if origin and origin not in ("https://" + host, "http://127.0.0.1:" + host.split(":")[-1], "http://localhost:" + host.split(":")[-1]):
+            self.send_error(403)
+            return
+        if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/x-www-form-urlencoded":
+            self.send_error(415)
+            return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400)
+            return
+        if not 0 < size <= 1024:
+            self.send_error(413)
+            return
+        try:
+            body = self.rfile.read(size).decode("utf-8", "strict")
+            payload = parse_qs(body, keep_blank_values=True)
+            value = payload.get("secret", [""])[0]
+            stage, note = self.call_loop(self.server.login_manager.submit_login(token, value))
+        except Exception:
+            LOG.exception("Login page processing failed (credentials redacted)")
+            self.send_error(503)
+            return
+        self.respond(200 if stage != "invalid" else 410, self.html_page(stage, token, note))
+
+
+def start_personal_web_server(manager: PersonalChatManager, loop):
+    try:
+        port = int(os.getenv("PORT", str(DEFAULT_PORT)))
+    except ValueError as exc:
+        raise SystemExit("PORT должен быть числом") from exc
+    if port == 0:
+        raise SystemExit("Для HTTPS-страницы авторизации Render Web Service нужен PORT, например 10000.")
+    if not 1 <= port <= 65535:
+        raise SystemExit("Недопустимый PORT")
+    server = ThreadingHTTPServer(("0.0.0.0", port), PersonalLoginHandler)
+    server.daemon_threads = True
+    server.login_manager = manager
+    server.bot_loop = loop
+    threading.Thread(target=server.serve_forever, daemon=True, name="login-portal").start()
+    LOG.info("Health and private login web server running on port %s", port)
+    return server
+
+
 async def run_personal_account():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     api_id, api_hash = personal_credentials()
@@ -1284,11 +1552,11 @@ async def run_personal_account():
         if me is not None and getattr(me, "bot", False):
             raise SystemExit("Нужна сессия обычного аккаунта, не бота.")
         if me is None:
-            LOG.warning("Аккаунт не авторизован: выполните python bot.py auth в терминале на этом сервере, затем перезапустите сервис.")
-        start_health_server()
+            LOG.info("Аккаунт не авторизован: отправьте /login +номер администраторскому боту.")
         api = BotAPI(token)
         store = Store(os.getenv("DB_PATH", DB_PATH))
         manager = PersonalChatManager(api, store, admin, client)
+        web_server = start_personal_web_server(manager, asyncio.get_running_loop())
         info = await manager.bot_call("getMe")
         if me:
             LOG.info("Bot @%s manages personal Telegram account %s", info.get("username"), me.id)
